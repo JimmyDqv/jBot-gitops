@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: Create jBot Pull Request Trigger Build Part
+Parameters:
+  CodeCommitRepoName:
+    Type: String
+    Description: Name of the CodeCommit repo to configure the bot for.
+  CodeBuildProjectName:
+    Type: String
+    Description: Name of the CodeBuild project to call
+  DestinationBranch:
+    Type: String
+    Description: Name of the branch to listen for open PR.
+    Default: master
+
+Resources:
+  # Common IAM Policies for all Lambda function roles
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestCloudWatch-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        - !Ref JBotPullRequestFunctionBuildRole
+        - !Ref JBotPullRequestFunctionCommentRole
+
+  # Lambda function and role that trigger CodeBuild
+  JBotPullRequestFunctionBuild:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPullRequestBuildPR-${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: build.handler
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref CodeBuildProjectName
+      Role: !GetAtt JBotPullRequestFunctionBuildRole.Arn
+  JBotPullRequestFunctionBuildRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CodeBuildPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestCodeBuild-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:*
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CodeBuildProjectName}"
+      Roles:
+        - !Ref JBotPullRequestFunctionBuildRole
+
+  # Lambda function and role that comment on the pull request
+  JBotPullRequestFunctionComment:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPullRequestCommentPR-${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: comment-pr.handler
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref CodeBuildProjectName
+      Role: !GetAtt JBotPullRequestFunctionCommentRole.Arn
+  JBotPullRequestFunctionCommentRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CodeCommitPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub PullRequestBotCodeCommit-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codecommit:PostCommentForPullRequest
+            Resource: !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}
+      Roles:
+        - !Ref JBotPullRequestFunctionCommentRole
+
+  # Eventbridge Rule and Role.
+  # Trigger when PR is opened for specific Git Repo
+  PullRequestEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger jBot when a pull request is created
+      EventPattern:
+        {
+          "source": ["aws.codecommit"],
+          "resources":
+            [
+              !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}",
+            ],
+          "detail-type": ["CodeCommit Pull Request State Change"],
+          "detail":
+            {
+              "pullRequestStatus": ["Open"],
+              "destinationReference": [!Sub "refs/heads/${DestinationBranch}"],
+            },
+        }
+      Name: !Sub jbotPullRequestOpenEvent-${CodeCommitRepoName}
+      State: ENABLED
+      Targets:
+        - Arn: !Ref JBotPullRequestStateMachine
+          RoleArn: !GetAtt EventsRuleRole.Arn
+          Id: !Sub jbotPullRequestOpenEvent-${CodeCommitRepoName}
+  EventsRuleRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  EventsRuleRoleInvokeStateMachinePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestEventRule-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:*
+            Resource: !Ref JBotPullRequestStateMachine
+      Roles:
+        - !Ref EventsRuleRole
+
+  # JBot State Machine Definition and Role
+  JBotPullRequestStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Sub jBotPullRequestOpenStateMachine-${CodeCommitRepoName}
+      RoleArn: !GetAtt JBotPullRequestStateMachineRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "StartBuild",
+          "States": {
+            "StartBuild": {
+              "Type": "Task",
+              "Resource": "${JBotPullRequestFunctionBuild.Arn}",
+              "Next": "CommentInParallel"
+            },
+            "CommentInParallel": {
+              "Type": "Parallel",
+              "End": true,
+              "Branches": [
+                {
+                  "StartAt": "CommentOnPullRequest",
+                  "States": {
+                    "CommentOnPullRequest": {
+                      "Type": "Task",
+                      "Resource": "${JBotPullRequestFunctionComment.Arn}",
+                      "End": true
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+  JBotPullRequestStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub jbotPullRequestStateMachine-${CodeCommitRepoName}
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "lambda:*"
+                Resource:
+                  - !GetAtt JBotPullRequestFunctionBuild.Arn
+                  - !GetAtt JBotPullRequestFunctionComment.Arn
+      RoleName: !Sub jbotPullRequestStateMachineRole-${CodeCommitRepoName}

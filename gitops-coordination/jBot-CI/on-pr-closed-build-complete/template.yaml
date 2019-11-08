@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: Create jBot on commit Build completed Part
+Parameters:
+  CodeCommitRepoName:
+    Type: String
+    Description: Name of the CodeCommit repo to configure the bot for.
+  CodeBuildProjectName:
+    Type: String
+    Description: Name of the CodeBuild project to listen for build complete
+  EnvironmentAlias:
+    Type: String
+    Description: The alias for the next environment to get a deploy
+  BuildArtifactBucketName:
+    Type: String
+    Description: The bucket that holds the build artifacts
+
+Resources:
+  # Eventbridge Rule and Role.
+  # Trigger when build for an commit is completed
+  BuildCompleteEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger jBot when a CodeBuild job completes
+      EventPattern:
+        {
+          "source": ["aws.codebuild"],
+          "detail-type": ["CodeBuild Build State Change"],
+          "detail":
+            {
+              "build-status": ["SUCCEEDED", "FAILED"],
+              "project-name": [!Sub "${CodeBuildProjectName}"],
+            },
+        }
+      Name: !Sub jbotPRClosedCompleted-${CodeCommitRepoName}
+      State: ENABLED
+      Targets:
+        - Arn: !Ref JBotPullRequestClosedBuildCompletedStateMachine
+          RoleArn: !GetAtt EventsRuleRole.Arn
+          Id: !Sub jbotPRClosedCompleted-${CodeCommitRepoName}
+  EventsRuleRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  EventsRuleRoleInvokeStateMachinePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jbotPRClosedCompletedEventRule-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:*
+            Resource: !Ref JBotPullRequestClosedBuildCompletedStateMachine
+      Roles:
+        - !Ref EventsRuleRole
+
+  # Common IAM Policies for all Lambda function roles
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jbotPRClosedCompletedCloudWatch-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionPrepareRole
+        - !Ref JBotPullRequestClosedFunctionQueueDeployRole
+
+  # Lambda function and role that prepares data for commenting
+  JBotPullRequestClosedFunctionPrepare:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPRClosedCompletedPrepare-${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: prepare.handler
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref CodeBuildProjectName
+      Role: !GetAtt JBotPullRequestClosedFunctionPrepareRole.Arn
+  JBotPullRequestClosedFunctionPrepareRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CodeBuildPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jbotPRClosedCompletedCodeBuild-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetProjects
+            Resource: "*"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionPrepareRole
+  CloudFormationPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jbotPRClosedCompletedCloudFormation-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+            Resource: "*"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionPrepareRole
+
+  # Lambda function and role that add to deployment queues
+  JBotPullRequestClosedFunctionQueueDeploy:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPRClosedCompletedQueueDeploy--${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: queue_deploy.handler
+      Environment:
+        Variables:
+          ENVIRONMENT_ALIAS: !Ref EnvironmentAlias
+          S3_ARTIFACT_BUCKET: !Ref BuildArtifactBucketName
+      Role: !GetAtt JBotPullRequestClosedFunctionQueueDeployRole.Arn
+  JBotPullRequestClosedFunctionQueueDeployRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  S3ArtifactAccessRole:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jbotPRClosedCompletedS3BuildArtifact-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: !Sub "arn:aws:s3:::${BuildArtifactBucketName}"
+          - Effect: Allow
+            Action:
+              - s3:*
+            Resource: !Sub "arn:aws:s3:::${BuildArtifactBucketName}/*"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionQueueDeployRole
+
+  # JBot State Machine Definition and Role
+  JBotPullRequestClosedBuildCompletedStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Sub jbotPRClosedCompletedStateMachine-${CodeCommitRepoName}
+      RoleArn: !GetAtt JBotPullRequestClosedBuildCompletedStateMachineRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "Prepare",
+          "States": {
+            "Prepare": {
+               "Type": "Task",
+                "Resource": "${JBotPullRequestClosedFunctionPrepare.Arn}",
+                "Next": "SuccessFailChoice"
+            },
+            "SuccessFailChoice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.STATUS",
+                  "StringEquals": "SUCCEEDED",
+                  "Next": "AddToDeploy"
+                }
+              ],
+              "Default": "CommentInParallel"
+            },
+            "AddToDeploy": {
+               "Type": "Task",
+                "Resource": "${JBotPullRequestClosedFunctionQueueDeploy.Arn}",
+                "End": true
+            }
+          }
+        }
+  JBotPullRequestClosedBuildCompletedStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub jbotPRClosedCompletedStateMachine-${CodeCommitRepoName}
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "lambda:*"
+                Resource:
+                  - !GetAtt JBotPullRequestClosedFunctionPrepare.Arn
+                  - !GetAtt JBotPullRequestClosedFunctionQueueDeploy.Arn
+      RoleName: !Sub jbotPRClosedCompletedStatemachine-${CodeCommitRepoName}

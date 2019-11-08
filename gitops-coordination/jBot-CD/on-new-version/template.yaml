@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: Create jBot pull request closed part
+Parameters:
+  CodeCommitRepoName:
+    Type: String
+    Description: Name of the CodeCommit repo to configure the bot for.
+  CodeBuildProjectName:
+    Type: String
+    Description: Name of the CodeBuild project to call for building / deploying new version
+  EnvironmentAlias:
+    Type: String
+    Description: Alias for the environment to deploy to.
+  BuildArtifactBucketName:
+    Type: String
+    Description: The bucket that holds the build artifacts
+
+Resources:
+  # Common IAM Policies for all Lambda function roles
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotNewVersionCloudWatch${CodeCommitRepoName}${EnvironmentAlias}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        - !Ref JBotNewVersionDetectedFunctionRole
+        - !Ref JBotDeployNewVersionStartFunctionRole
+
+  # Lambda function and role invoked when new version is detected.
+  # This will start the deploy StepFunctions
+  JBotNewVersionDetectedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotNewVersionDetected${CodeCommitRepoName}${EnvironmentAlias}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: version-detected.handler
+      Environment:
+        Variables:
+          STATE_MACHINE: !Ref JBotDeployNewVersionStateMachine
+      Role: !GetAtt JBotNewVersionDetectedFunctionRole.Arn
+  JBotNewVersionDetectedFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  S3NewVersionLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt JBotNewVersionDetectedFunction.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      #SourceArn: String
+  StateMachinePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotNewVersionStateMachine${EnvironmentAlias}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !Ref JBotDeployNewVersionStateMachine
+      Roles:
+        - !Ref JBotNewVersionDetectedFunctionRole
+
+  # Lambda function and role to invoke CodeBuild or CodeDeploy
+  JBotDeployNewVersionStartFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotDeployNewVersionStart${CodeCommitRepoName}${EnvironmentAlias}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: start-build.handler
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref CodeBuildProjectName
+          ENV_ALIAS: !Ref EnvironmentAlias
+      Role: !GetAtt JBotDeployNewVersionStartFunctionRole.Arn
+  JBotDeployNewVersionStartFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CodeBuildPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotNewVersionCodeBuild${CodeCommitRepoName}${EnvironmentAlias}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:*
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CodeBuildProjectName}"
+      Roles:
+        - !Ref JBotDeployNewVersionStartFunctionRole
+
+  # JBot State Machine Definition and Role
+  JBotDeployNewVersionStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Sub "jBotDeployNewVersion${CodeCommitRepoName}${EnvironmentAlias}"
+      RoleArn: !GetAtt JBotDeployNewVersionStateMachineRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "StartDeploy",
+          "States": {
+            "StartDeploy": {
+              "Type": "Task",
+              "Resource": "${JBotDeployNewVersionStartFunction.Arn}",
+              "End": true
+            }
+          }
+        }
+
+  JBotDeployNewVersionStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub jBotDeployStateMachine${CodeCommitRepoName}${EnvironmentAlias}
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "lambda:*"
+                Resource:
+                  - !GetAtt JBotDeployNewVersionStartFunction.Arn
+      RoleName: !Sub "jBotDeployStateMachine${CodeCommitRepoName}${EnvironmentAlias}Role"
+
+Outputs:
+  JBotNewVersionDetectedFunction:
+    Description: The ARN of the Lambda that detects new files in the artifact bucket
+    Value: !GetAtt JBotNewVersionDetectedFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}:new-version-function

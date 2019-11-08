@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: Create jBot pull request closed part
+Parameters:
+  CodeCommitRepoName:
+    Type: String
+    Description: Name of the CodeCommit repo to configure the bot for.
+  CodeBuildProjectName:
+    Type: String
+    Description: Name of the CodeBuild project to call for building new version
+  TeardownProjectName:
+    Type: String
+    Description: Name of the CodeBuild project to call for teardown temp environments
+  BranchName:
+    Type: String
+    Description: Name of the branch to listen for  closed pull requests
+
+Resources:
+  # Common IAM Policies for all Lambda function roles
+  CloudWatchLogsPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestClosedCloudWatch-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:*
+            Resource: "arn:aws:logs:*:*:*"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionBuildRole
+        - !Ref JBotPullRequestClosedFunctionTeardownRole
+        - !Ref JBotPullRequestClosedFunctionPrepareRole
+
+  # Lambda function and role for preparing the event
+  JBotPullRequestClosedFunctionPrepare:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPullRequestClosedPrepare-${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: prepare.handler
+      Role: !GetAtt JBotPullRequestClosedFunctionBuildRole.Arn
+  JBotPullRequestClosedFunctionPrepareRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  # Lambda function and role that trigger CodeBuild for building
+  JBotPullRequestClosedFunctionBuild:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPullRequestClosedBuild-${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: build.handler
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref CodeBuildProjectName
+      Role: !GetAtt JBotPullRequestClosedFunctionBuildRole.Arn
+  JBotPullRequestClosedFunctionBuildRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CodeBuildPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestClosedCodeBuild-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:*
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CodeBuildProjectName}"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionBuildRole
+
+  # Lambda function and role that trigger CodeBuild for teardown temp environments
+  JBotPullRequestClosedFunctionTeardown:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub jbotPullRequestClosedTeardown-${CodeCommitRepoName}
+      Runtime: python3.6
+      MemorySize: 256
+      Timeout: 25
+      CodeUri: ./src
+      Handler: teardown.handler
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref TeardownProjectName
+      Role: !GetAtt JBotPullRequestClosedFunctionTeardownRole.Arn
+  JBotPullRequestClosedFunctionTeardownRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  CodeBuildTeardownPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestClosedCodeBuildTeardown-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:*
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/${TeardownProjectName}"
+      Roles:
+        - !Ref JBotPullRequestClosedFunctionTeardownRole
+
+  # Eventbridge Rule and Role.
+  # Trigger when PR is closed towards specific branch
+  PullRequestClosedEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "Trigger jBot when a pr merge to ${BranchName} happens"
+      EventPattern:
+        {
+          "detail-type": ["CodeCommit Pull Request State Change"],
+          "resources":
+            [
+              !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}",
+            ],
+          "source": ["aws.codecommit"],
+          "detail":
+            {
+              "pullRequestStatus": ["Closed"],
+              "destinationReference": [!Sub "refs/heads/${BranchName}"],
+            },
+        }
+      Name: !Sub jbotPullRequestClosedEvent-${CodeCommitRepoName}
+      State: ENABLED
+      Targets:
+        - Arn: !Ref JBotPullRequestClosedStateMachine
+          RoleArn: !GetAtt EventsRuleRole.Arn
+          Id: !Sub jbotPullRequestClosedEventTrigger-${CodeCommitRepoName}
+  EventsRuleRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+  EventsRuleRoleInvokeStateMachinePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub jBotPullRequestClosedEventRule-${CodeCommitRepoName}
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:*
+            Resource: !Ref JBotPullRequestClosedStateMachine
+      Roles:
+        - !Ref EventsRuleRole
+
+  # JBot State Machine Definition and Role
+  JBotPullRequestClosedStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: !Sub jBotPullRequestClosedStateMachine-${CodeCommitRepoName}
+      RoleArn: !GetAtt JBotPullRequestClosedStateMachineRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "Prepare",
+          "States": {
+            "Prepare": {
+              "Type": "Task",
+              "Resource": "${JBotPullRequestClosedFunctionPrepare.Arn}",
+              "Next": "CheckIfMerged"
+            },
+            "CheckIfMerged": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.IS_MERGED",
+                  "StringEquals": "True",
+                  "Next": "StartBuild"
+                }
+              ],
+              "Default": "TeardownTempEnvironment"
+            },
+            "StartBuild": {
+              "Type": "Task",
+              "Resource": "${JBotPullRequestClosedFunctionBuild.Arn}",
+              "Next": "TeardownTempEnvironment"
+            },
+            "TeardownTempEnvironment": {
+              "Type": "Task",
+              "Resource": "${JBotPullRequestClosedFunctionTeardown.Arn}",
+              "End": true
+            }
+          }
+        }
+  JBotPullRequestClosedStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub jbotPullRequestClosedStateMachine-${CodeCommitRepoName}
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "lambda:*"
+                Resource:
+                  - !GetAtt JBotPullRequestClosedFunctionPrepare.Arn
+                  - !GetAtt JBotPullRequestClosedFunctionBuild.Arn
+                  - !GetAtt JBotPullRequestClosedFunctionTeardown.Arn
+      RoleName: !Sub jbotPullRequestClosedStateMachineRole-${CodeCommitRepoName}
